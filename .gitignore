@@ -1,0 +1,101 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Model weights (usually large files)
+*.pt
+*.pth
+*.ckpt
+*.weights
+yolov8*.pt
+yolov8*.onnx
+
+# Output files
+*.csv
+*.avi
+*.mp4
+*.mov
+distance_results.csv
+distance_baseline_output.avi
+output_video.avi
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.backup
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS specific
+.DS_Store
+Thumbs.db
+*.lnk
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Misc
+.cache/
+*.pickle
+*.pkl
+
+# Demo/Input video (optional - uncomment if you have demo videos you don't want to track)
+# demo/1/output.mp4
+
+# Temporary directories
+tmp/
+temp/
