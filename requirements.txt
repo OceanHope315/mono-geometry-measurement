@@ -1,14 +1,24 @@
 # Core Dependencies
-opencv-python>=4.8.0
-torch>=2.0.0
-torchvision>=0.15.0
-numpy>=1.24.0
-ultralytics>=8.0.0
+opencv-python>=4.8.0      # 视频处理、图像操作、可视化
+torch>=2.0.0              # 深度学习框架（MiDaS、YOLOv8）
+torchvision>=0.15.0       # 图像模型库
+numpy>=1.24.0             # 数值计算
+ultralytics>=8.0.0        # YOLOv8 目标检测
 
-# Additional utilities
-pillow>=9.5.0
-matplotlib>=3.7.0
-tqdm>=4.65.0
+# Image Processing & Visualization
+pillow>=9.5.0             # 图像处理辅助
+matplotlib>=3.7.0         # 绘图（可选，用于后续可视化增强）
 
-# Optional: for GPU acceleration (uncomment if using NVIDIA GPU)
-# torch-cuda  # Requires installation via conda or specific CUDA version
+# Utilities
+tqdm>=4.65.0              # 进度条显示
+
+# Optional: GPU Acceleration (Recommended for speed)
+# If using NVIDIA GPU:
+# Install CUDA Toolkit first: https://developer.nvidia.com/cuda-toolkit
+# Then PyTorch will automatically use GPU
+# torch will auto-detect CUDA availability and use GPU by default
+
+# Note: 
+# - First run will auto-download YOLOv8 weights (~25MB) and MiDaS model (~100MB)
+# - Requires internet connection for initial model download
+# - Total disk space needed: ~200MB (models + dependencies)
