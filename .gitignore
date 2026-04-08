@@ -51,15 +51,24 @@ yolov8*.pt
 yolov8*.onnx
 
 # Output files
+results/
+distance_results.csv
+distance_baseline_output.avi
+output_video.avi
+
+# Ignore generated media files by default
 *.csv
 *.avi
 *.mp4
 *.mov
 *.png
-results/
-distance_results.csv
-distance_baseline_output.avi
-output_video.avi
+
+# But keep input videos under videos/
+!videos/
+!videos/*.mp4
+!videos/*.avi
+!videos/**/*.mp4
+!videos/**/*.avi
 
 # Temporary files
 *.tmp
