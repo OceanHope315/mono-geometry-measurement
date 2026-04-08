@@ -1,7 +1,9 @@
 import cv2
 import csv
+import os
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 from ultralytics import YOLO
 
 
@@ -56,6 +58,11 @@ class MonoDistanceBaseline:
         self.output_video = "distance_baseline_output2.avi"
         self.video_writer = None
 
+        # 可选的图像输出目录，由 process_video_list 设置
+        self.plot_distance_dir = None
+        self.plot_speed_dir = None
+        self.plot_ttc_dir = None
+
         self.frame_id = 0
         self.target_counter = 0
 
@@ -72,6 +79,17 @@ class MonoDistanceBaseline:
 
         # 【新增】每个target_id单独维护的速度历史（最近5帧）
         self.target_speed_history = {}
+
+        # 【新增】主目标状态变量，用于后续只关注最重要的前车
+        self.main_target_id = None
+        self.main_target_min_track_frames = 5
+        self.main_target_max_center_offset_ratio = 0.25
+        self.main_target_max_distance_m = 35.0
+        self.target_track_age = {}
+        self.target_positive_speed_count = {}
+        
+        # 【新增】所有目标的序列数据，用于后续绘图
+        self.all_target_data = {}  # {target_id: {"frames": [], "distance": [], "speed": [], "ttc": []}}
 
         # 【新增】TTC告警阈值
         self.ttc_warning = 5.0  # 单位：秒，黄色告警
@@ -199,6 +217,10 @@ class MonoDistanceBaseline:
                 del self.target_distance_history[t_id]
             if t_id in self.target_speed_history:
                 del self.target_speed_history[t_id]
+            if t_id in self.target_track_age:
+                del self.target_track_age[t_id]
+            if t_id in self.target_positive_speed_count:
+                del self.target_positive_speed_count[t_id]
 
         return assigned_id
 
@@ -403,6 +425,13 @@ class MonoDistanceBaseline:
         min_ttc = float("inf")
         min_ttc_target_id = None
 
+        # 【新增】主目标候选列表，用于后续选取最重要的前车目标
+        frame_width = frame_bgr.shape[1]
+        main_target_candidates = []
+
+        # 第一阶段：收集每个检测目标的中间结果
+        detections_info = []
+
         # 1. 整帧深度估计
         depth_map = self.estimate_depth_map(frame_bgr)
 
@@ -435,30 +464,19 @@ class MonoDistanceBaseline:
                 distance_m = self.fuse_depth_and_geometry(
                     class_name, bbox_height_px, depth_score)
 
-                # 【新增】检查距离估计有效性，无效则跳过该检测框
                 if distance_m < 0:
                     continue
 
-                # 【修改】使用改进跟踪获取target_id，传入class_name以增强匹配约束
                 target_id = self.assign_track_id(x1, y1, x2, y2, class_name)
 
-                # ========== 【新增】距离跳变抑制 ==========
-                # 核心逻辑：如果该target已有历史且当前distance_m与上一帧平滑距离变化超过30%，
-                # 则基于前一帧平滑距离做温和更新而不是直接采用当前值（防止bbox高度抖动污染后续速度/TTC）
                 if target_id in self.target_distance_history and self.target_distance_history[target_id]:
-                    # 取上一帧的平滑距离
                     prev_smoothed = self.robust_smooth_distance(
                         self.target_distance_history[target_id])
-
-                    # 计算相对变化：当前值 vs 上一帧平滑值
                     rel_change = abs(distance_m - prev_smoothed) / \
                         max(prev_smoothed, 1e-6)
-
-                    # 若相对变化超过30%，做温和指数混合（70% 前帧 + 30% 当前）
                     if rel_change > 0.3:
                         distance_m = 0.7 * prev_smoothed + 0.3 * distance_m
 
-                # 5. 距离平滑（按目标单独维护历史，鲁棒平滑减少抖动对速度/TTC的放大）
                 if target_id not in self.target_distance_history:
                     self.target_distance_history[target_id] = []
                 self.target_distance_history[target_id].append(distance_m)
@@ -467,15 +485,15 @@ class MonoDistanceBaseline:
                 smoothed_distance = self.robust_smooth_distance(
                     self.target_distance_history[target_id])
 
-                # 【新增】相对速度计算（线性拟合历史距离斜率，更抗抖动）
-                # 正速度表示接近（距离下降），负速度表示远离（距离增大）
-                velocity_mps = self.estimate_velocity_from_history(
-                    self.target_distance_history[target_id])
-                # 【新增】物理限幅：防止极端异常值污染TTC
+                raw_speed_mps = 0.0
+                history = self.target_distance_history[target_id]
+                if len(history) >= 2 and self.dt > 1e-6:
+                    raw_speed_mps = (history[-2] - history[-1]) / self.dt
+
+                velocity_mps = self.estimate_velocity_from_history(history)
                 velocity_mps = np.clip(
                     velocity_mps, -self.max_abs_speed_mps, self.max_abs_speed_mps)
 
-                # 平滑速度（最近5个速度值的均值）
                 if target_id not in self.target_speed_history:
                     self.target_speed_history[target_id] = []
                 self.target_speed_history[target_id].append(velocity_mps)
@@ -483,86 +501,222 @@ class MonoDistanceBaseline:
                     self.target_speed_history[target_id].pop(0)
                 smoothed_velocity = np.mean(
                     self.target_speed_history[target_id]) if self.target_speed_history[target_id] else velocity_mps
-                # 【新增】二次限幅：确保最终速度也在合理范围
                 smoothed_velocity = np.clip(
                     smoothed_velocity, -self.max_abs_speed_mps, self.max_abs_speed_mps)
 
-                # 【新增】TTC计算
-                # 仅当目标接近速度超过最小有效阈值时才计算TTC，以抑制噪声
+                if target_id not in self.target_track_age:
+                    self.target_track_age[target_id] = 0
+                self.target_track_age[target_id] += 1
+
+                if smoothed_velocity > self.min_valid_approach_speed_mps:
+                    self.target_positive_speed_count[target_id] = self.target_positive_speed_count.get(
+                        target_id, 0) + 1
+                else:
+                    self.target_positive_speed_count[target_id] = 0
+
+                center_x = (x1 + x2) / 2.0
+                if smoothed_distance < self.main_target_max_distance_m:
+                    center_offset_ratio = abs(
+                        center_x - frame_width / 2.0) / frame_width
+                    if center_offset_ratio < self.main_target_max_center_offset_ratio:
+                        main_target_candidates.append({
+                            "target_id": target_id,
+                            "smoothed_distance": smoothed_distance,
+                            "center_x": center_x
+                        })
+
                 if smoothed_velocity > self.min_valid_approach_speed_mps:
                     ttc_s = smoothed_distance / smoothed_velocity
                 else:
                     ttc_s = float("inf")
-                # 对显示进行简单截断，避免极大值
-                ttc_display = min(ttc_s, 99.9) if ttc_s != float(
-                    "inf") else 99.9
 
-                # 【新增】更新本帧最危险目标
                 if ttc_s != float("inf") and ttc_s < min_ttc:
                     min_ttc = ttc_s
                     min_ttc_target_id = target_id
-                    # 【新增】调试：打印最危险目标详细信息
                     if self.debug:
                         print(
                             f"[DEBUG] Frame {self.frame_id} MinTTC Target: ID={target_id}, Class={class_name}, Dist={smoothed_distance:.1f}m, Vel={smoothed_velocity:.1f}m/s, TTC={ttc_s:.1f}s")
 
-                # 6. 可视化
-                # 根据TTC值选择框颜色
-                if ttc_s < self.ttc_danger:
-                    color = (0, 0, 255)  # 红色，危险
-                elif ttc_s < self.ttc_warning:
-                    color = (0, 255, 255)  # 黄色，警告
+                detections_info.append({
+                    "target_id": target_id,
+                    "class_name": class_name,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "bbox_height_px": bbox_height_px,
+                    "depth_score": depth_score,
+                    "distance_m": distance_m,
+                    "smoothed_distance": smoothed_distance,
+                    "raw_speed_mps": raw_speed_mps,
+                    "velocity_mps": velocity_mps,
+                    "smoothed_velocity": smoothed_velocity,
+                    "ttc_s": ttc_s,
+                    "center_x": center_x,
+                })
+
+        if main_target_candidates:
+            if self.main_target_id is not None:
+                still_main = next(
+                    (c for c in main_target_candidates if c["target_id"] == self.main_target_id), None)
+                if still_main is not None:
+                    self.main_target_id = still_main["target_id"]
                 else:
-                    color = (0, 255, 0)  # 绿色，安全
+                    self.main_target_id = min(
+                        main_target_candidates, key=lambda c: c["smoothed_distance"])["target_id"]
+            else:
+                self.main_target_id = min(
+                    main_target_candidates, key=lambda c: c["smoothed_distance"])["target_id"]
+        else:
+            self.main_target_id = None
 
-                cv2.rectangle(vis_frame, (int(x1), int(y1)),
-                              (int(x2), int(y2)), color, 2)
-
-                # 【修改】根据重要性构建标签：重要目标显示完整标签，非重要只显示简短标签
-                is_important = (smoothed_distance < 25) or (
-                    ttc_s != float("inf")) or (target_id == min_ttc_target_id)
-                if is_important:
-                    if ttc_s == float("inf"):
-                        ttc_str = "inf"
-                    else:
-                        ttc_str = f"{min(ttc_s, 99.9):.1f}"
-                    label = f"{class_name} | {smoothed_distance:.1f}m | v:{smoothed_velocity:.1f}m/s | TTC:{ttc_str}s"
-                else:
-                    label = f"{class_name} | {smoothed_distance:.1f}m"
-                cv2.putText(
-                    vis_frame,
-                    label,
-                    (int(x1), max(20, int(y1) - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    color,
-                    2
-                )
-
-                # 7. 写入 CSV
-                ttc_csv = "inf" if ttc_s == float("inf") else round(ttc_s, 3)
-                self.csv_writer.writerow([
-                    self.frame_id, target_id, class_name,
-                    round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2),
-                    round(bbox_height_px, 2),
-                    round(depth_score, 4),
-                    round(smoothed_distance, 2),
-                    round(smoothed_velocity, 3),
-                    ttc_csv
-                ])
-
-        # 【新增】保存本帧最危险目标信息
         self.current_min_ttc = min_ttc
         self.current_min_ttc_target_id = min_ttc_target_id
 
-        # 【新增】每隔10帧打印调试信息
+        for det in detections_info:
+            target_id = det["target_id"]
+            ttc_s = det["ttc_s"]
+            smoothed_velocity = det["smoothed_velocity"]
+            smoothed_distance = det["smoothed_distance"]
+            distance_m = det["distance_m"]
+            raw_speed_mps = det["raw_speed_mps"]
+            velocity_mps = det["velocity_mps"]
+
+            show_full_ttc = (
+                target_id == self.main_target_id
+                and self.target_track_age.get(target_id, 0) >= self.main_target_min_track_frames
+                and self.target_positive_speed_count.get(target_id, 0) >= 3
+            )
+
+            if show_full_ttc:
+                if ttc_s < self.ttc_danger:
+                    color = (0, 0, 255)
+                elif ttc_s < self.ttc_warning:
+                    color = (0, 255, 255)
+                else:
+                    color = (0, 255, 0)
+            else:
+                color = (0, 255, 0)
+
+            cv2.rectangle(vis_frame, (int(det["x1"]), int(det["y1"])),
+                          (int(det["x2"]), int(det["y2"])), color, 2)
+
+            if show_full_ttc:
+                if ttc_s == float("inf"):
+                    ttc_str = "inf"
+                else:
+                    ttc_str = f"{min(ttc_s, 99.9):.1f}"
+                label = f"{det['class_name']} | {smoothed_distance:.1f}m | v:{smoothed_velocity:.1f}m/s | TTC:{ttc_str}s"
+            else:
+                label = f"{det['class_name']} | {smoothed_distance:.1f}m"
+
+            cv2.putText(
+                vis_frame,
+                label,
+                (int(det["x1"]), max(20, int(det["y1"]) - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2
+            )
+
+            # --- 收集多目标绘图数据 ---
+            if target_id not in self.all_target_data:
+                self.all_target_data[target_id] = {
+                    "frames": [],
+                    "distance": [],
+                    "speed": [],
+                    "ttc": []
+                }
+            
+            # 存入数据
+            self.all_target_data[target_id]["frames"].append(self.frame_id)
+            self.all_target_data[target_id]["distance"].append(smoothed_distance)
+            self.all_target_data[target_id]["speed"].append(smoothed_velocity)
+            self.all_target_data[target_id]["ttc"].append(ttc_s)
+
+            ttc_csv = "inf" if ttc_s == float("inf") else round(ttc_s, 3)
+            self.csv_writer.writerow([
+                self.frame_id, target_id, det["class_name"],
+                round(det["x1"], 2), round(det["y1"], 2), round(
+                    det["x2"], 2), round(det["y2"], 2),
+                round(det["bbox_height_px"], 2),
+                round(det["depth_score"], 4),
+                round(smoothed_distance, 2),
+                round(smoothed_velocity, 3),
+                ttc_csv
+            ])
+
         if self.debug and self.frame_id % 10 == 0:
             print(
                 f"[DEBUG] Frame {self.frame_id}: MinTTC_ID={self.current_min_ttc_target_id}, MinTTC={self.current_min_ttc:.1f}s")
 
         return vis_frame
 
-    def run(self):
+    def save_all_target_plots(self, video_name: str):
+        if not self.all_target_data:
+            print(f"[{video_name}] 没有收集到目标数据，跳过绘图。")
+            return
+
+        # 过滤并排序：选择跟踪帧数最多的前3个目标
+        valid_targets = []
+        for tid, data in self.all_target_data.items():
+            if len(data["frames"]) >= 10:  # 至少跟踪10帧才绘图
+                valid_targets.append((tid, data))
+        
+        # 按帧数降序排列，取前3个
+        top_targets = sorted(valid_targets, key=lambda x: len(x[1]["frames"]), reverse=True)[:3]
+
+        if not top_targets:
+            print(f"[{video_name}] 没有满足条件（>10帧）的目标，跳过绘图。")
+            return
+
+        for tid, data in top_targets:
+            frames = data["frames"]
+            dist = data["distance"]
+            speed = data["speed"]
+            ttc = data["ttc"]
+
+            # 1. 距离曲线
+            plt.figure()
+            plt.plot(frames, dist, marker='o', markersize=2)
+            plt.xlabel("Frame ID")
+            plt.ylabel("Distance (m)")
+            plt.title(f"Target {tid} Distance Curve ({video_name})")
+            plt.grid(True)
+            dist_name = f"{video_name}_target_{tid}_distance.png"
+            dist_path = os.path.join(self.plot_distance_dir, dist_name) if self.plot_distance_dir else dist_name
+            plt.savefig(dist_path)
+            plt.close()
+
+            # 2. 速度曲线
+            plt.figure()
+            plt.plot(frames, speed, marker='o', markersize=2, color='orange')
+            plt.xlabel("Frame ID")
+            plt.ylabel("Speed (m/s)")
+            plt.title(f"Target {tid} Speed Curve ({video_name})")
+            plt.grid(True)
+            speed_name = f"{video_name}_target_{tid}_speed.png"
+            speed_path = os.path.join(self.plot_speed_dir, speed_name) if self.plot_speed_dir else speed_name
+            plt.savefig(speed_path)
+            plt.close()
+
+            # 3. TTC 曲线
+            ttc_plot = [20.0 if x == float("inf") else x for x in ttc]
+            plt.figure()
+            plt.plot(frames, ttc_plot, marker='o', markersize=2, color='red')
+            plt.xlabel("Frame ID")
+            plt.ylabel("TTC (s)")
+            plt.title(f"Target {tid} TTC Curve ({video_name}, inf->20)")
+            plt.grid(True)
+            ttc_name = f"{video_name}_target_{tid}_ttc.png"
+            ttc_path = os.path.join(self.plot_ttc_dir, ttc_name) if self.plot_ttc_dir else ttc_name
+            plt.savefig(ttc_path)
+            plt.close()
+
+        print(f"[{video_name}] 已为前 {len(top_targets)} 个目标生成了 {len(top_targets)*3} 张曲线图。")
+
+    def run(self, video_name: str = "output"):
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             print(f"无法打开视频: {self.video_path}")
@@ -620,10 +774,58 @@ class MonoDistanceBaseline:
         if self.video_writer:
             self.video_writer.release()
         self.csv_file.close()
+        self.save_all_target_plots(video_name)
         print(f"处理完成，结果已保存到: {self.output_csv} 和 {self.output_video}")
 
 
+def process_video_list(video_dir: str, output_dir: str = None):
+    """批量处理视频目录下的所有 MP4 视频，并输出对应的 AVI 与 CSV 文件。"""
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    video_files = sorted([
+        f for f in os.listdir(video_dir)
+        if f.lower().endswith(".mp4")
+    ])
+
+    if not video_files:
+        print(f"未找到 {video_dir} 下的 MP4 视频文件。")
+        return
+
+    for video_file in video_files:
+        video_path = os.path.join(video_dir, video_file)
+        base_name = os.path.splitext(video_file)[0]
+        if output_dir:
+            csv_dir = os.path.join(output_dir, "csv")
+            avi_dir = os.path.join(output_dir, "avi")
+            distance_plot_dir = os.path.join(output_dir, "distance_curve")
+            speed_plot_dir = os.path.join(output_dir, "speed_curve")
+            ttc_plot_dir = os.path.join(output_dir, "ttc_curve")
+            os.makedirs(csv_dir, exist_ok=True)
+            os.makedirs(avi_dir, exist_ok=True)
+            os.makedirs(distance_plot_dir, exist_ok=True)
+            os.makedirs(speed_plot_dir, exist_ok=True)
+            os.makedirs(ttc_plot_dir, exist_ok=True)
+
+            output_csv = os.path.join(
+                csv_dir, f"{base_name}.csv")
+            output_video = os.path.join(
+                avi_dir, f"{base_name}.avi")
+        else:
+            output_csv = f"{base_name}.csv"
+            output_video = f"{base_name}.avi"
+
+        print(f"\n====== 处理视频: {video_file} ======")
+        app = MonoDistanceBaseline(video_path, output_csv=output_csv)
+        app.output_video = output_video
+        if output_dir:
+            app.plot_distance_dir = distance_plot_dir
+            app.plot_speed_dir = speed_plot_dir
+            app.plot_ttc_dir = ttc_plot_dir
+        app.run(video_name=base_name)
+
+
 if __name__ == "__main__":
-    video_path = r".\demo\2\output.mp4"
-    app = MonoDistanceBaseline(video_path)
-    app.run()
+    video_dir = r".\videos"
+    output_dir = r".\results"
+    process_video_list(video_dir, output_dir)

@@ -55,6 +55,8 @@ yolov8*.onnx
 *.avi
 *.mp4
 *.mov
+*.png
+results/
 distance_results.csv
 distance_baseline_output.avi
 output_video.avi

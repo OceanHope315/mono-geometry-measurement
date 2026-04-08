@@ -4,19 +4,17 @@ torch>=2.0.0              # 深度学习框架（MiDaS、YOLOv8）
 torchvision>=0.15.0       # 图像模型库
 numpy>=1.24.0             # 数值计算
 ultralytics>=8.0.0        # YOLOv8 目标检测
+matplotlib>=3.7.0         # 绘图（用于生成多目标曲线图）
+timm>=0.9.0               # MiDaS 模型依赖
 
 # Image Processing & Visualization
 pillow>=9.5.0             # 图像处理辅助
-matplotlib>=3.7.0         # 绘图（可选，用于后续可视化增强）
+
+# 如果在无图形界面服务器上运行，推荐使用 headless 版本
+# opencv-python-headless>=4.8.0
 
 # Utilities
 tqdm>=4.65.0              # 进度条显示
-
-# Optional: GPU Acceleration (Recommended for speed)
-# If using NVIDIA GPU:
-# Install CUDA Toolkit first: https://developer.nvidia.com/cuda-toolkit
-# Then PyTorch will automatically use GPU
-# torch will auto-detect CUDA availability and use GPU by default
 
 # Note: 
 # - First run will auto-download YOLOv8 weights (~25MB) and MiDaS model (~100MB)
