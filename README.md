@@ -1,122 +1,215 @@
-# 单目距离估计与多目标风险评估系统
-## Mono Distance & Multi-Target TTC Baseline
+下面是**中文版 README**，可以直接复制到 `README.md` 里。
 
-## 1. 项目简介
+````markdown
+# 单目驾驶场景几何测量系统
 
-本项目实现了一个基于**单目视频**的驾驶场景目标级感知原型系统。系统能够对前方车辆目标进行：
+本项目实现了一个基于单目视频的驾驶场景目标级几何测量 baseline。
 
-- 目标检测
-- 跨帧跟踪
-- 距离估计
-- 相对速度估计
-- TTC（Time-To-Collision）碰撞时间估计
-- 风险可视化与批量结果导出
+系统从单目行车视频中检测车辆目标，并估计目标的：
 
-本系统的目标不是实现高精度工业级测量，而是搭建一个完整的**“单目视频 → 距离 / 速度 / TTC → 风险分析”**原型链路，用于验证目标级几何测量与风险感知流程。
+- 距离 Distance
+- 相对速度 Relative Speed
+- 碰撞时间 Time-To-Collision，简称 TTC
+
+本项目主要用于课程项目、组会汇报和算法原型验证。当前结果更适合作为**趋势分析和风险指标**，不应直接理解为高精度真实测距结果。
 
 ---
 
-## 2. 系统功能
+## 1. 项目功能
 
-当前版本主要支持以下功能：
+本系统支持以下功能：
 
-### 2.1 多目标检测
-使用 **YOLOv8** 对驾驶相关目标进行检测，仅保留以下类别：
+- 使用 YOLO 检测驾驶场景中的车辆目标
+- 使用 ByteTrack 或 IoU + 中心点距离进行跨帧目标跟踪
+- 使用 Depth Anything V2 Metric Outdoor 或 MiDaS 估计深度图
+- 基于单目几何公式估计目标距离
+- 基于距离历史估计目标相对速度
+- 根据距离和相对速度计算 TTC
+- 输出可视化视频、CSV 数据、深度图和曲线图
 
-- `car`
-- `bus`
-- `truck`
-- `motorcycle`
+---
 
-### 2.2 多目标跟踪
-使用轻量级目标关联方法完成跨帧 ID 跟踪，关联依据包括：
+## 2. 当前系统流程
 
-- 类别一致性
-- 检测框中心点距离
-- IoU（Intersection over Union）
+整体处理流程如下：
 
-### 2.3 单目距离估计
-距离估计采用“**几何弱标定 + 深度趋势修正**”的方式：
-
-- 几何部分：基于相机焦距、目标真实高度先验、检测框高度估计米制距离
-- 深度部分：使用 **MiDaS** 提供相对深度趋势，对几何距离进行轻量修正
-
-### 2.4 相对速度估计
-基于目标最近若干帧距离历史，使用**线性拟合斜率**估计相对速度，而不是直接用相邻帧差分，从而提升抗抖动能力。
-
-### 2.5 TTC 风险评估
-基于：
-
-\[
-TTC = \frac{distance}{relative\_speed}
-\]
-
-在目标接近速度超过最小有效阈值时计算 TTC，并根据 TTC 大小进行风险等级显示：
-
-- **红色**：TTC < 2.0 s
-- **黄色**：TTC < 5.0 s
-- **绿色**：安全或无显著接近风险
-
-### 2.6 批量处理
-支持对 `videos/` 目录下所有 `.mp4` 视频进行批量处理，自动生成：
-
-- 可视化 `.avi`
-- 结构化 `.csv`
-- 多目标曲线图 `.png`
+```text
+输入视频
+    ↓
+逐帧读取图像
+    ↓
+YOLO 检测车辆目标
+    ↓
+ByteTrack / IoU 目标跟踪
+    ↓
+Depth Anything V2 / MiDaS 深度估计
+    ↓
+bbox 几何距离估计
+    ↓
+距离序列平滑
+    ↓
+相对速度估计
+    ↓
+TTC 计算
+    ↓
+输出视频、CSV、深度图和曲线图
+````
 
 ---
 
 ## 3. 项目结构
 
+推荐项目结构如下：
+
 ```text
-.
-├── mono_distance_baseline.py      # 主程序
-├── README.md                      # 项目说明文档
-├── requirements.txt               # 依赖列表
-├── videos/                        # 输入视频目录（.mp4）
-└── results/                       # 输出目录
-    ├── avi/                       # 每个视频的可视化结果 (.avi)
-    ├── csv/                       # 每个视频的逐帧结果 (.csv)
-    ├── distance_curve/            # 距离曲线图
-    ├── speed_curve/               # 速度曲线图
-    └── ttc_curve/                 # TTC 曲线图
-````
+mono-geometry-measurement/
+├── mono_distance_baseline.py
+├── README.md
+├── requirements.txt
+├── .gitignore
+├── depth_anything_v2/
+│   ├── dpt.py
+│   └── ...
+├── weights/
+│   └── .gitkeep
+├── videos/
+│   └── .gitkeep
+└── simple/
+    ├── csv/
+    ├── avi/
+    ├── depth/
+    ├── intermediate/
+    ├── distance_curve/
+    ├── speed_curve/
+    └── ttc_curve/
+```
+
+说明：
+
+* `mono_distance_baseline.py`：主程序
+* `depth_anything_v2/`：Depth Anything V2 相关代码
+* `weights/`：存放 YOLO 权重文件
+* `videos/`：存放输入视频
+* `simple/`：默认输出目录
+* `csv/`：输出每一帧的测量结果
+* `avi/`：输出可视化视频
+* `depth/`：输出深度图
+* `intermediate/`：输出原图与深度图拼接后的中间结果
+* `distance_curve/`：输出目标距离曲线
+* `speed_curve/`：输出目标速度曲线
+* `ttc_curve/`：输出目标 TTC 曲线
 
 ---
 
 ## 4. 环境要求
 
-* Python 3.8 及以上
-* 推荐使用虚拟环境
-* 推荐使用 NVIDIA GPU（用于加速 MiDaS 推理）
-* Windows / Linux 均可运行
+推荐环境：
 
----
+* Python 3.10 或 Python 3.11
+* PyTorch
+* OpenCV
+* Ultralytics YOLO
+* NumPy
+* Matplotlib
 
-## 5. 安装方法
-
-### 5.1 安装依赖
+安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 5.2 准备模型
+一个基础的 `requirements.txt` 可以写成：
 
-程序运行时会自动加载：
+```text
+opencv-python
+torch
+torchvision
+numpy
+matplotlib
+ultralytics
+```
 
-* `yolov8n.pt`
-* `MiDaS_small`
+如果使用 Depth Anything V2，需要保证项目目录中存在：
 
-如果网络环境受限，可能需要提前准备相关模型或科学上网环境。
+```text
+depth_anything_v2/
+```
+
+否则代码中的导入语句会报错：
+
+```python
+from depth_anything_v2.dpt import DepthAnythingV2
+```
 
 ---
 
-## 6. 使用方法
+## 5. 模型权重准备
 
-### 6.1 准备输入视频
+本仓库不建议上传大模型权重文件。
 
-将待处理的 `.mp4` 视频放入：
+需要用户自行下载并放置模型权重。
+
+---
+
+### 5.1 YOLO 检测模型
+
+代码中默认使用：
+
+```python
+self.detector_weights = r"D:\baseline\weights\yolo11s.pt"
+```
+
+建议将 YOLO 权重放在：
+
+```text
+weights/yolo11s.pt
+```
+
+也可以使用其他 YOLO 权重，例如：
+
+```text
+yolov8n.pt
+yolo11s.pt
+yolo11m.pt
+```
+
+如果指定的 YOLO11s 权重不存在，代码会尝试回退到：
+
+```text
+yolov8n.pt
+```
+
+---
+
+### 5.2 Depth Anything V2 Metric Outdoor 权重
+
+代码中默认使用：
+
+```python
+self.depth_model_path = r"D:\baseline\Depth-Anything-V2\checkpoints\depth_anything_v2_metric_vkitti_vits.pth"
+```
+
+建议将 Depth Anything V2 权重放在：
+
+```text
+Depth-Anything-V2/checkpoints/
+```
+
+例如：
+
+```text
+Depth-Anything-V2/checkpoints/depth_anything_v2_metric_vkitti_vits.pth
+```
+
+如果 Depth Anything V2 加载失败，程序会尝试回退到 MiDaS。
+
+如果 MiDaS 也无法加载，程序会禁用深度估计，仅使用 bbox 几何距离估计。
+
+---
+
+## 6. 输入视频
+
+将输入视频放到：
 
 ```text
 videos/
@@ -125,346 +218,288 @@ videos/
 例如：
 
 ```text
-videos/
-├── video_1.mp4
-├── video_2.mp4
-├── ...
-└── video_10.mp4
+videos/video_5.mp4
 ```
 
-### 6.2 运行程序
+当前主程序默认处理：
+
+```python
+video_path = r".\videos\video_5.mp4"
+```
+
+如果要处理其他视频，可以修改这行代码：
+
+```python
+video_path = r".\videos\your_video.mp4"
+```
+
+---
+
+## 7. 运行方法
+
+在项目根目录运行：
 
 ```bash
 python mono_distance_baseline.py
 ```
 
-程序会自动遍历 `videos/` 目录下所有 `.mp4` 文件，并将结果输出到 `results/` 目录。
+程序会依次执行：
 
----
+1. 加载 YOLO 检测模型
+2. 加载 Depth Anything V2 或回退到 MiDaS
+3. 读取输入视频
+4. 逐帧检测和跟踪车辆目标
+5. 估计距离、相对速度和 TTC
+6. 保存可视化结果和数据文件
 
-## 7. 输出结果说明
+运行过程中会弹出可视化窗口。
 
----
-
-### 7.1 AVI 可视化视频
-
-输出位置：
-
-```text
-results/avi/
-```
-
-文件命名格式：
+按下：
 
 ```text
-{video_name}.avi
+q
 ```
 
-视频中会显示：
-
-* 检测框
-* 类别名称
-* 平滑后的距离
-* 对主目标的速度与 TTC 信息
-* 风险颜色（红 / 黄 / 绿）
+可以提前退出程序。
 
 ---
 
-### 7.2 CSV 结构化结果
+## 8. 输出结果
 
-输出位置：
+默认输出目录为：
 
 ```text
-results/csv/
+simple/
 ```
 
-文件命名格式：
+输出内容包括：
 
 ```text
-{video_name}.csv
+simple/
+├── csv/
+│   └── video_1.csv
+├── avi/
+│   └── video_1.avi
+├── depth/
+│   └── depth_0001.png
+├── intermediate/
+│   └── vis_0001.png
+├── distance_curve/
+│   └── video_1_target_x_distance.png
+├── speed_curve/
+│   └── video_1_target_x_speed.png
+└── ttc_curve/
+    └── video_1_target_x_ttc.png
 ```
-
-CSV 中包含以下字段：
-
-* `frame_id`：帧号
-* `target_id`：目标 ID
-* `class_name`：目标类别
-* `x1, y1, x2, y2`：检测框坐标
-* `bbox_height_px`：检测框高度（像素）
-* `depth_score`：深度修正分数
-* `distance_m`：平滑后距离（米）
-* `relative_speed_mps`：平滑后相对速度（m/s）
-* `ttc_s`：碰撞时间（秒，若无风险则为 `inf`）
 
 ---
 
-### 7.3 多目标曲线图
+## 9. CSV 字段说明
 
-输出位置：
+CSV 文件中每一行表示某一帧中某一个目标的测量结果。
+
+| 字段                   | 含义            |
+| -------------------- | ------------- |
+| `frame_id`           | 当前帧编号         |
+| `target_id`          | 目标跟踪 ID       |
+| `class_name`         | 稳定后的目标类别      |
+| `x1, y1, x2, y2`     | 目标检测框坐标       |
+| `bbox_height_px`     | 检测框高度，单位为像素   |
+| `depth_score`        | 目标区域的深度分数     |
+| `distance_m`         | 平滑后的估计距离，单位为米 |
+| `relative_speed_mps` | 估计相对速度，单位为米/秒 |
+| `ttc_s`              | 碰撞时间 TTC，单位为秒 |
+
+---
+
+## 10. 核心算法说明
+
+---
+
+### 10.1 车辆检测
+
+系统使用 YOLO 检测驾驶相关目标。
+
+当前保留的类别包括：
 
 ```text
-results/distance_curve/
-results/speed_curve/
-results/ttc_curve/
+car
+bus
+truck
+motorcycle
 ```
 
-对于每个视频，系统会：
+检测结果包括：
 
-1. 统计所有目标的跟踪轨迹长度
-2. 过滤掉跟踪帧数不足 10 帧的目标
-3. 选取**跟踪帧数最多的前 3 个目标**
-4. 为每个目标分别生成 3 张曲线图：
+* 类别
+* 置信度
+* bbox 坐标
 
-   * 距离曲线
-   * 速度曲线
-   * TTC 曲线
+低置信度目标会被过滤。
 
-文件命名格式如下：
+---
+
+### 10.2 目标跟踪
+
+系统优先使用 ByteTrack 提供的目标 ID。
+
+如果 ByteTrack 没有返回 ID，则使用自定义的目标关联逻辑。
+
+自定义关联逻辑主要依据：
+
+* bbox 中心点距离
+* IoU
+* 类别一致性软约束
+
+这样可以尽量保持同一个真实目标在多帧中的 `target_id` 一致。
+
+---
+
+### 10.3 稳定类别
+
+在实际视频中，同一辆车可能会被 YOLO 在不同帧中识别为不同类别。
+
+例如：
 
 ```text
-{video_name}_target_{target_id}_distance.png
-{video_name}_target_{target_id}_speed.png
-{video_name}_target_{target_id}_ttc.png
+car → truck
+truck → car
 ```
 
-#### 数量说明
+为了减少类别抖动，系统为每个目标维护类别历史，并使用多数投票得到稳定类别。
 
-如果输入视频数为 10，每个视频成功选出 3 个有效长轨迹目标，则最终会生成：
+当前阶段的重点是距离、速度和 TTC，而不是精细车型识别。
 
-* 10 × 3 × 3 = **90 张 PNG 图**
-
-如果某个视频中满足条件的目标少于 3 个，则该视频生成的 PNG 数量会少于 9 张。
-
----
-
-## 8. 核心算法说明
-
----
-
-### 8.1 目标检测
-
-系统使用 YOLOv8 进行目标检测，并过滤掉与驾驶风险评估无关的类别，仅保留车辆相关目标。
-
----
-
-### 8.2 目标跟踪
-
-每一帧检测到的目标需要与历史轨迹进行匹配。当前版本采用轻量级关联策略：
-
-* 仅在同类别目标之间匹配
-* 计算中心点欧氏距离
-* 计算检测框 IoU
-* 使用评分函数：
-
-[
-score = center_distance - 100 \times IoU
-]
-
-满足阈值条件时复用已有 ID，否则创建新 ID。
-
-该方法实现简单，适合原型验证，但在遮挡、多目标密集交互场景下仍可能出现 ID 漂移。
-
----
-
-### 8.3 单目距离估计
-
-距离估计采用几何弱标定方法：
-
-[
-distance = \frac{f \cdot H}{h}
-]
-
-其中：
-
-* (f)：焦距（像素）
-* (H)：目标真实高度先验
-* (h)：检测框高度（像素）
-
-代码中使用的目标高度先验包括：
-
-* `car = 1.5 m`
-* `bus = 3.0 m`
-* `truck = 3.2 m`
-* `motorcycle = 1.4 m`
-
----
-
-### 8.4 MiDaS 深度修正
-
-MiDaS 输出的是**相对深度图**，并非直接的米制距离，因此本系统不直接用它作为最终距离，而是仅作为趋势修正项。
-
-同时，为减少背景干扰，深度分数只从检测框的**下 1/3 区域**提取，并裁掉左右边缘，再通过中位数与去极值策略获得鲁棒深度分数。
-
----
-
-### 8.5 距离平滑
-
-单目距离容易受到检测框抖动影响，因此系统加入两层稳健处理：
-
-#### 1）跳变抑制
-
-如果当前距离相较上一时刻平滑距离变化过大，则进行软更新，避免瞬时异常值污染后续速度估计。
-
-#### 2）鲁棒平滑
-
-对最近 5 帧距离做：
-
-* 中位数参考
-* 异常值剔除
-* 均值输出
-
-从而降低检测抖动带来的高频噪声。
-
----
-
-### 8.6 相对速度估计
-
-速度估计不是简单的相邻帧差分，而是使用最近若干帧距离历史做线性拟合：
-
-[
-d = a t + b
-]
-
-则相对速度定义为：
-
-[
-v = -a
-]
-
-其中：
-
-* 正速度：目标接近
-* 负速度：目标远离
-
-此外，系统对速度做了限幅：
-
-* 最大绝对速度 `15 m/s`
-
-用于抑制极端异常值。
-
----
-
-### 8.7 TTC 估计
-
-仅当目标满足**有效接近条件**时，才计算 TTC：
-
-[
-TTC = \frac{distance}{speed}
-]
-
-否则 TTC 记为 `inf`。
-
-当前版本使用的最小有效接近速度阈值为：
-
-* `0.5 m/s`
-
-这样可以抑制由于微小噪声造成的虚假风险。
-
----
-
-## 9. 当前版本的特点与局限
-
-### 9.1 优点
-
-* 已经打通完整的目标级测量链路
-* 能同时处理多个视频
-* 能导出多目标曲线图用于分析
-* 能初步区分“接近目标”和“远离目标”
-* 具备一定的趋势感知能力
-
-### 9.2 局限
-
-当前系统仍属于**研究原型**，存在以下限制：
-
-1. **距离绝对精度有限**
-   单目距离估计依赖目标真实高度先验和检测框高度，对 bbox 抖动较敏感。
-
-2. **TTC 更适合作为风险趋势指标，而非精确碰撞真值**
-   当前 TTC 主要反映短时接近风险趋势。
-
-3. **目标跟踪仍可能出现 ID 漂移**
-   尤其是在目标遮挡、交叉、密集场景中。
-
-4. **未做 ego-motion 补偿**
-   当前速度更准确地说是“相对接近趋势速度”，没有显式补偿自车运动。
-
-5. **TTC 图中会将 `inf` 截断为 20 用于可视化**
-   这只是为了便于观察，不表示真实 TTC 就是 20 秒。
-
----
-
-## 10. 推荐的结果解读方式
-
-在分析曲线图时，建议重点关注：
-
-* **距离曲线**：是否总体平滑、是否呈持续接近或远离趋势
-* **速度曲线**：是否存在明显尖峰、是否与距离变化方向一致
-* **TTC 曲线**：是否随风险增加而下降，是否出现异常跳变
-
-目前更适合将本系统输出理解为：
-
-* **趋势分析工具**
-* **多目标风险感知原型**
-* **目标级时序测量实验平台**
-
-而不是高精度工业级测距系统。
-
----
-
-## 11. 后续改进方向
-
-后续可以从以下几个方向继续完善：
-
-1. **改进 tracking 稳定性**
-
-   * 引入运动预测
-   * 使用更成熟的多目标跟踪算法（如 ByteTrack / SORT / DeepSORT）
-
-2. **提升距离估计稳定性**
-
-   * 对 bbox 高度进一步平滑
-   * 引入地面平面约束 / 相机标定信息
-   * 优化深度融合策略
-
-3. **改进速度与 TTC 可靠性**
-
-   * 更强的时序滤波
-   * 更鲁棒的主目标锁定机制
-   * 将 TTC 从“单点估计”改成“带置信度的风险估计”
-
-4. **增强实验分析能力**
-
-   * 输出更多对比图
-   * 区分主目标与其他目标
-   * 增加主目标切换日志
-
----
-
-## 12. 运行示例
-
-```bash
-python mono_distance_baseline.py
-```
-
-运行后可能输出类似日志：
+因此在显示层中，`car / truck / bus` 可以统一显示为：
 
 ```text
-====== 处理视频: video_1.mp4 ======
-开始处理视频，FPS = 30.00
-[video_1] 已为前 3 个目标生成了 9 张曲线图。
-处理完成，结果已保存到: results/csv/video_1.csv 和 results/avi/video_1.avi
+vehicle
+```
+
+这样可以避免画面中出现“小车被显示成 truck”的问题。
+
+---
+
+### 10.4 距离估计
+
+系统使用单目几何公式估计距离：
+
+```text
+distance = focal_length × real_object_height / bbox_height
+```
+
+含义是：
+
+* 目标在图像中越大，距离通常越近
+* 目标在图像中越小，距离通常越远
+
+当前代码中使用弱先验参数：
+
+```python
+self.focal_length_px = 800.0
+```
+
+为了降低 `car / truck / bus` 类别抖动对距离的影响，当前可以将这些车辆统一使用相近的真实高度先验。
+
+---
+
+### 10.5 深度估计
+
+系统支持 Depth Anything V2 Metric Outdoor。
+
+如果加载失败，会尝试使用 MiDaS。
+
+深度图主要用于辅助距离趋势修正。
+
+需要注意：
+
+> 当前深度估计结果不是严格的真实距离，只能作为单目测距的辅助信息。
+
+---
+
+### 10.6 距离平滑
+
+bbox 抖动会导致距离估计抖动。
+
+因此系统为每个目标维护最近几帧的距离历史，并进行鲁棒平滑。
+
+主要策略包括：
+
+* 最近 5 帧距离历史
+* 中位数异常值过滤
+* 距离突变抑制
+
+---
+
+### 10.7 相对速度估计
+
+系统根据目标距离随时间的变化估计相对速度。
+
+如果距离逐渐减小，说明目标正在接近。
+
+如果距离逐渐增大，说明目标正在远离。
+
+系统使用多帧距离历史进行线性拟合，避免只用相邻两帧差分造成速度尖峰。
+
+速度符号约定：
+
+```text
+正速度：目标正在接近
+负速度：目标正在远离
+0 附近：目标距离基本稳定
 ```
 
 ---
 
-## 13. 致谢
+### 10.8 TTC 计算
 
-本项目使用了以下开源组件：
+TTC 是 Time-To-Collision，即碰撞时间。
 
-* [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics)
-* [MiDaS](https://github.com/isl-org/MiDaS)
-* OpenCV
-* NumPy
-* Matplotlib
+计算公式：
+
+```text
+TTC = distance / relative_speed
+```
+
+只有当目标明显接近时，才计算有效 TTC。
+
+如果目标没有明显接近，则：
+
+```text
+TTC = inf
+```
+
+在曲线图中，为了方便显示，`inf` 可能会被截断为 20 秒。
+
+这并不代表真实 TTC 等于 20 秒，而是表示当前没有有效碰撞时间。
+
+---
+
+## 11. 当前局限性
+
+本项目当前仍存在以下限制：
+
+1. 单目距离估计依赖相机焦距和目标真实高度先验。
+2. bbox 抖动会影响距离估计。
+3. 目标跟踪仍可能出现 ID 切换或轨迹分裂。
+4. YOLO 对车辆类别的区分较粗，容易出现 `car / truck` 抖动。
+5. Depth Anything V2 / MiDaS 深度结果主要用于辅助趋势，不是严格真值。
+6. TTC 更适合作为风险趋势指标，不应被当作真实物理碰撞时间。
+
+---
+
+## 12. 后续改进方向
+
+后续可以从以下方向继续优化：
+
+* 使用更稳定的多目标跟踪算法，例如 ByteTrack、DeepSORT 或 OC-SORT
+* 使用驾驶场景数据集微调 YOLO
+* 增加车辆细分类模型，识别 sedan、SUV、van、truck 等类别
+* 使用更准确的 metric depth 模型
+* 加入相机标定参数
+* 增加车道线或自车运动信息
+* 改进距离、速度和 TTC 的有效性门控
+* 将 TTC 明确区分为 valid / invalid 状态
+* 添加更完善的实验评估指标
 
 ---
