@@ -6,6 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ultralytics import YOLO
 
+from depth_anything_v2.dpt import DepthAnythingV2
+
 
 class MonoDistanceBaseline:
     def __init__(self, video_path: str, output_csv: str = "distance_results2.csv"):
@@ -15,26 +17,18 @@ class MonoDistanceBaseline:
         # 只保留和驾驶目标相关的类别
         self.valid_classes = {"car", "bus", "truck", "motorcycle"}
 
-        # ========== 1. 加载 YOLO ==========
-        self.detector = YOLO("yolov8n.pt")
+        # ========== 1. 模型路径配置 ==========
+        self.detector_weights = r"D:\baseline\weights\yolo11s.pt"
+        self.depth_model_path = r"D:\baseline\Depth-Anything-V2\checkpoints\depth_anything_v2_metric_vkitti_vits.pth"
+        # ========== 2. 加载视频检测模型 YOLO11s ==========
+        self.detector = self.load_yolo_detector(self.detector_weights)
 
-        # ========== 2. 加载 MiDaS ==========
+        # ========== 3. 加载深度估计模型 ==========
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.midas = None
+        self.depth_method = "none"
+        self.depth_model = None
         self.transform = None
-        try:
-            self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
-            self.midas.to(self.device)
-            self.midas.eval()
-
-            # MiDaS 预处理
-            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-            self.transform = midas_transforms.small_transform
-        except Exception as e:
-            print("警告：无法通过 torch.hub 下载或加载 MiDaS 模型，已禁用深度辅助距离估计。")
-            print("请检查网络连接或 GitHub 访问权限。错误详情：", e)
-            self.midas = None
-            self.transform = None
+        self.load_depth_model()
 
         # 相机弱先验参数（第1周先简化）
         self.focal_length_px = 800.0
@@ -62,6 +56,8 @@ class MonoDistanceBaseline:
         self.plot_distance_dir = None
         self.plot_speed_dir = None
         self.plot_ttc_dir = None
+        self.depth_dir = None
+        self.intermediate_dir = None
 
         self.frame_id = 0
         self.target_counter = 0
@@ -71,7 +67,7 @@ class MonoDistanceBaseline:
         self.dt = 1.0 / 25.0
 
         # 【新增】目标跟踪状态
-        # tracks: {track_id: {"center_x": x, "center_y": y, "bbox": (x1,y1,x2,y2), "class_name": str, "last_frame": frame_id}}
+        # tracks: {track_id: {"center_x": x, "center_y": y, "bbox": (x1,y1,x2,y2), "class_name": str, "last_frame": frame_id, "bbox_history": []}}
         self.tracks = {}
 
         # 【新增】每个target_id单独维护的距离历史（最近5帧）
@@ -87,9 +83,10 @@ class MonoDistanceBaseline:
         self.main_target_max_distance_m = 35.0
         self.target_track_age = {}
         self.target_positive_speed_count = {}
-        
+
         # 【新增】所有目标的序列数据，用于后续绘图
-        self.all_target_data = {}  # {target_id: {"frames": [], "distance": [], "speed": [], "ttc": []}}
+        # {target_id: {"frames": [], "distance": [], "speed": [], "ttc": []}}
+        self.all_target_data = {}
 
         # 【新增】TTC告警阈值
         self.ttc_warning = 5.0  # 单位：秒，黄色告警
@@ -138,17 +135,34 @@ class MonoDistanceBaseline:
         iou = inter_area / union_area
         return float(iou)
 
+    def _compute_stable_class(self, class_history: list, current_stable: str, track_age: int) -> str:
+        if not class_history:
+            return current_stable
+
+        counts = {}
+        for c in class_history:
+            counts[c] = counts.get(c, 0) + 1
+
+        majority_class = max(counts, key=counts.get)
+        majority_count = counts[majority_class]
+
+    # 最近 5 帧里某类别出现 3 次，就认为它更可信
+        if majority_count >= 3:
+            return majority_class
+
+        return current_stable
+
     def assign_track_id(self, x1: float, y1: float, x2: float, y2: float, class_name: str) -> int:
         """
-        改进的目标跟踪，结合中心点距离、IoU 和类别一致性约束。
+        改进的目标跟踪，结合中心点距离、IoU 和类别一致性软约束。
 
         逻辑：
-        1. 只在类别相同的 tracks 中找候选
+        1. 允许跨类别匹配，但不同类别会增加 score 惩罚
         2. 计算中心点距离和 IoU
-        3. 使用评分函数：score = center_distance - 100 * iou
+        3. 使用评分函数：score = center_distance - 100 * iou + class_penalty
         4. 选择最小 score 的候选，且满足距离 < 50 或 IoU > 0.1
         5. 否则分配新 ID
-        6. 更新 track 的中心点、bbox、class_name 和 last_frame
+        6. 更新 track 的中心点、bbox、class_name、class_history 和 stable_class
         """
         curr_cx = (x1 + x2) / 2.0
         curr_cy = (y1 + y2) / 2.0
@@ -156,14 +170,12 @@ class MonoDistanceBaseline:
 
         best_track_id = None
         best_score = float('inf')
-        distance_threshold = 50.0  # 像素
+        distance_threshold = 50.0  # 稍微放宽距离阈值，配合软约束
         iou_threshold = 0.1
+        class_penalty = 30.0      # 类别不一致时的惩罚分
 
-        # 只在类别相同的 tracks 中搜索
+        # 在所有已有 tracks 中搜索
         for track_id, track in self.tracks.items():
-            if track["class_name"] != class_name:
-                continue
-
             track_cx = track["center_x"]
             track_cy = track["center_y"]
             track_box = track["bbox"]
@@ -175,8 +187,9 @@ class MonoDistanceBaseline:
             # 计算 IoU
             iou = self.compute_iou(curr_box, track_box)
 
-            # 评分函数：中心距离减去 IoU 加权
-            score = center_distance - 100 * iou
+            # 评分函数：中心距离减去 IoU 加权 + 类别惩罚
+            penalty = 0.0 if track["class_name"] == class_name else class_penalty
+            score = center_distance - 100 * iou + penalty
 
             # 检查是否满足匹配条件
             if (center_distance < distance_threshold or iou > iou_threshold) and score < best_score:
@@ -186,11 +199,31 @@ class MonoDistanceBaseline:
         # 决策：复用已有 ID 或分配新 ID
         if best_track_id is not None:
             assigned_id = best_track_id
-            self.tracks[assigned_id]["center_x"] = curr_cx
-            self.tracks[assigned_id]["center_y"] = curr_cy
-            self.tracks[assigned_id]["bbox"] = curr_box
-            self.tracks[assigned_id]["class_name"] = class_name
-            self.tracks[assigned_id]["last_frame"] = self.frame_id
+            old_stable = self.tracks[assigned_id].get(
+                "stable_class", class_name)
+            self.tracks[assigned_id].update({
+                "center_x": curr_cx,
+                "center_y": curr_cy,
+                "bbox": curr_box,
+                "class_name": class_name,
+                "last_frame": self.frame_id
+            })
+
+            self.tracks[assigned_id]["class_history"].append(class_name)
+            if len(self.tracks[assigned_id]["class_history"]) > 5:
+                self.tracks[assigned_id]["class_history"].pop(0)
+
+            track_age = self.target_track_age.get(assigned_id, 0)
+            self.tracks[assigned_id]["stable_class"] = self._compute_stable_class(
+                self.tracks[assigned_id]["class_history"], old_stable, track_age)
+
+            # 更新 bbox_history
+            if "bbox_history" not in self.tracks[assigned_id]:
+                self.tracks[assigned_id]["bbox_history"] = []
+            self.tracks[assigned_id]["bbox_history"].append(curr_box)
+            if len(self.tracks[assigned_id]["bbox_history"]) > 5:
+                self.tracks[assigned_id]["bbox_history"].pop(0)
+
         else:
             # 分配新 ID
             self.target_counter += 1
@@ -200,6 +233,9 @@ class MonoDistanceBaseline:
                 "center_y": curr_cy,
                 "bbox": curr_box,
                 "class_name": class_name,
+                "stable_class": class_name,
+                "class_history": [class_name],
+                "bbox_history": [curr_box],
                 "last_frame": self.frame_id
             }
 
@@ -224,28 +260,179 @@ class MonoDistanceBaseline:
 
         return assigned_id
 
+    def update_track_with_id(self, target_id, x1: float, y1: float, x2: float, y2: float, class_name: str) -> int:
+        """
+        使用 ByteTrack 提供的 ID 更新或初始化 track。
+        如果 track 不存在则创建，否则更新。
+        """
+        curr_cx = (x1 + x2) / 2.0
+        curr_cy = (y1 + y2) / 2.0
+        curr_box = (x1, y1, x2, y2)
+
+        if target_id not in self.tracks:
+            # 新 track，初始化
+            self.tracks[target_id] = {
+                "center_x": curr_cx,
+                "center_y": curr_cy,
+                "bbox": curr_box,
+                "class_name": class_name,
+                "stable_class": class_name,
+                "class_history": [class_name],
+                "bbox_history": [curr_box],
+                "last_frame": self.frame_id
+            }
+        else:
+            # 已有 track，更新
+            old_stable = self.tracks[target_id].get("stable_class", class_name)
+
+            self.tracks[target_id].update({
+                "center_x": curr_cx,
+                "center_y": curr_cy,
+                "bbox": curr_box,
+                "class_name": class_name,
+                "last_frame": self.frame_id
+            })
+
+            self.tracks[target_id]["class_history"].append(class_name)
+            if len(self.tracks[target_id]["class_history"]) > 7:
+                self.tracks[target_id]["class_history"].pop(0)
+
+            track_age = self.target_track_age.get(target_id, 0)
+            self.tracks[target_id]["stable_class"] = self._compute_stable_class(
+                self.tracks[target_id]["class_history"],
+                old_stable,
+                track_age
+            )
+
+            self.tracks[target_id]["bbox_history"].append(curr_box)
+            if len(self.tracks[target_id]["bbox_history"]) > 5:
+                self.tracks[target_id]["bbox_history"].pop(0)
+
+        return target_id
+
+    def get_smoothed_bbox(self, bbox_history: list) -> tuple:
+        """
+        对bbox历史做滑动平均，返回平滑后的bbox。
+        """
+        if not bbox_history:
+            return (0, 0, 0, 0)
+        if len(bbox_history) == 1:
+            return bbox_history[0]
+
+        # 取最近3-5帧
+        recent = bbox_history[-5:] if len(bbox_history) >= 5 else bbox_history
+
+        # 计算平均
+        x1s = [b[0] for b in recent]
+        y1s = [b[1] for b in recent]
+        x2s = [b[2] for b in recent]
+        y2s = [b[3] for b in recent]
+
+        smoothed_x1 = np.mean(x1s)
+        smoothed_y1 = np.mean(y1s)
+        smoothed_x2 = np.mean(x2s)
+        smoothed_y2 = np.mean(y2s)
+
+        return (smoothed_x1, smoothed_y1, smoothed_x2, smoothed_y2)
+
+    def load_yolo_detector(self, weights_path: str):
+        if os.path.exists(weights_path):
+            try:
+                return YOLO(weights_path)
+            except Exception as e:
+                print(
+                    f"警告：无法加载 YOLO11s 权重 '{weights_path}'，回退到 yolov8n.pt。错误：{e}")
+        else:
+            print(f"警告：未找到 YOLO11s 权重文件 '{weights_path}'，回退到 yolov8n.pt。")
+        return YOLO("yolov8n.pt")
+
+    def load_depth_model(self):
+        """加载 Depth Anything V2 Metric Outdoor，如失败回退到 MiDaS。"""
+        try:
+            encoder = "vits"  # small 版本
+
+            model_configs = {
+                "vits": {
+                    "encoder": "vits",
+                    "features": 64,
+                    "out_channels": [48, 96, 192, 384]
+                },
+                "vitb": {
+                    "encoder": "vitb",
+                    "features": 128,
+                    "out_channels": [96, 192, 384, 768]
+                },
+                "vitl": {
+                    "encoder": "vitl",
+                    "features": 256,
+                    "out_channels": [256, 512, 1024, 1024]
+                },
+            }
+
+            if not os.path.exists(self.depth_model_path):
+                raise FileNotFoundError(f"找不到深度模型权重: {self.depth_model_path}")
+
+            self.depth_model = DepthAnythingV2(**model_configs[encoder])
+
+            state_dict = torch.load(self.depth_model_path,
+                                    map_location=self.device)
+            self.depth_model.load_state_dict(state_dict)
+
+            self.depth_model = self.depth_model.to(self.device).eval()
+            self.depth_method = "depth_anything"
+
+            print(
+                f"已加载 Depth Anything V2 Metric Outdoor: {self.depth_model_path}")
+            return
+
+        except Exception as e:
+            print("警告：Depth Anything 模型加载失败，尝试回退 MiDaS。", e)
+
+        try:
+            self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+            self.midas.to(self.device)
+            self.midas.eval()
+
+            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+            self.transform = midas_transforms.small_transform
+
+            self.depth_method = "midas"
+            print("使用 MiDaS 深度模型作为回退。")
+
+        except Exception as e:
+            print("警告：无法加载任何深度模型，已禁用深度估计。", e)
+            self.midas = None
+            self.transform = None
+            self.depth_method = "none"
+
     def estimate_depth_map(self, frame_bgr: np.ndarray) -> np.ndarray:
         """
-        使用 MiDaS 估计整帧深度图
-        输出是相对深度，不是直接米
-        如果 MiDaS 模型不可用，则返回全 0 的深度图，后续仅使用几何距离估计。
+        使用 Depth Anything 或 MiDaS 估计整帧深度图。
+        输出是归一化相对深度，不是直接米。
+        若没有深度模型，则返回全 0 的深度图。
         """
-        if self.midas is None or self.transform is None:
+        if self.depth_method == "depth_anything":
+            return self.estimate_depth_map_depth_anything(frame_bgr)
+
+        if self.depth_method == "midas":
+            if self.midas is None or self.transform is None:
+                return np.zeros(frame_bgr.shape[:2], dtype=np.float32)
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            input_batch = self.transform(frame_rgb).to(self.device)
+
+            with torch.no_grad():
+                prediction = self.midas(input_batch)
+                prediction = torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1),
+                    size=frame_rgb.shape[:2],
+                    mode="bicubic",
+                    align_corners=False
+                ).squeeze()
+
+            depth_map = prediction.cpu().numpy()
+        else:
             return np.zeros(frame_bgr.shape[:2], dtype=np.float32)
-
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        input_batch = self.transform(frame_rgb).to(self.device)
-
-        with torch.no_grad():
-            prediction = self.midas(input_batch)
-            prediction = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1),
-                size=frame_rgb.shape[:2],
-                mode="bicubic",
-                align_corners=False
-            ).squeeze()
-
-        depth_map = prediction.cpu().numpy()
 
         depth_min = depth_map.min()
         depth_max = depth_map.max()
@@ -258,16 +445,43 @@ class MonoDistanceBaseline:
             depth_map, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         return depth_map
 
+    def estimate_depth_map_depth_anything(self, frame_bgr: np.ndarray) -> np.ndarray:
+        try:
+            with torch.no_grad():
+                depth_map = self.depth_model.infer_image(frame_bgr)
+
+            depth_map = np.asarray(depth_map)
+
+            depth_min = np.nanmin(depth_map)
+            depth_max = np.nanmax(depth_map)
+
+            if depth_max - depth_min > 1e-6:
+                depth_map = (depth_map - depth_min) / (depth_max - depth_min)
+            else:
+                depth_map = np.zeros(frame_bgr.shape[:2], dtype=np.float32)
+
+            depth_map = np.nan_to_num(
+                depth_map,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0
+            ).astype(np.float32)
+
+            return depth_map
+
+        except Exception as e:
+            print("警告：Depth Anything 推理失败，回退到 MiDaS 或空深度图。", e)
+            self.depth_method = "midas"
+            return self.estimate_depth_map(frame_bgr)
+
     def get_object_real_height(self, class_name: str) -> float:
-        if class_name == "car":
-            return self.car_real_height_m
-        if class_name == "bus":
-            return self.bus_real_height_m
-        if class_name == "truck":
-            return self.truck_real_height_m
+        # 当前阶段重点是距离/速度/TTC，不是车型细分类
+        # car/truck/bus 的误分类会造成距离跳变，所以先统一车辆高度
+        if class_name in {"car", "truck", "bus", "vehicle"}:
+            return 1.7
         if class_name == "motorcycle":
-            return self.motorcycle_real_height_m
-        return 1.5
+            return 1.4
+        return 1.7
 
     def robust_depth_score(self, depth_map: np.ndarray, bbox) -> float:
         """
@@ -435,8 +649,18 @@ class MonoDistanceBaseline:
         # 1. 整帧深度估计
         depth_map = self.estimate_depth_map(frame_bgr)
 
-        # 2. 目标检测
-        results = self.detector(frame_bgr, verbose=False)
+        # 生成深度图可视化
+        depth_vis = (depth_map * 255).astype(np.uint8)
+        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_MAGMA)
+
+        # 保存深度图可视化
+        if self.depth_dir:
+            cv2.imwrite(os.path.join(
+                self.depth_dir, f"depth_{self.frame_id:04d}.png"), depth_vis)
+
+        # 2. 目标检测和跟踪
+        results = self.detector.track(
+            frame_bgr, persist=True, tracker='bytetrack.yaml', verbose=False)
 
         for result in results:
             boxes = result.boxes
@@ -460,14 +684,31 @@ class MonoDistanceBaseline:
                 depth_score = self.robust_depth_score(
                     depth_map, (x1, y1, x2, y2))
 
-                # 4. 融合几何弱标定 + 深度趋势
+                # 4. 目标 ID 关联：优先使用 ByteTrack 的 ID，否则自己分配
+                if box.id is not None:
+                    target_id = int(box.id[0].item())
+                    target_id = self.update_track_with_id(
+                        target_id, x1, y1, x2, y2, class_name)
+                else:
+                    target_id = self.assign_track_id(
+                        x1, y1, x2, y2, class_name)
+
+                stable_class = self.tracks[target_id]["stable_class"]
+
+                # 获取平滑后的bbox
+                smoothed_bbox = self.get_smoothed_bbox(
+                    self.tracks[target_id]["bbox_history"])
+                smoothed_x1, smoothed_y1, smoothed_x2, smoothed_y2 = smoothed_bbox
+                smoothed_center_x = (smoothed_x1 + smoothed_x2) / 2.0
+                smoothed_center_y = (smoothed_y1 + smoothed_y2) / 2.0
+                smoothed_bbox_height_px = max(1.0, smoothed_y2 - smoothed_y1)
+
+                # 5. 基于稳定类别融合几何弱标定 + 深度趋势
                 distance_m = self.fuse_depth_and_geometry(
-                    class_name, bbox_height_px, depth_score)
+                    stable_class, smoothed_bbox_height_px, depth_score)
 
                 if distance_m < 0:
                     continue
-
-                target_id = self.assign_track_id(x1, y1, x2, y2, class_name)
 
                 if target_id in self.target_distance_history and self.target_distance_history[target_id]:
                     prev_smoothed = self.robust_smooth_distance(
@@ -514,7 +755,7 @@ class MonoDistanceBaseline:
                 else:
                     self.target_positive_speed_count[target_id] = 0
 
-                center_x = (x1 + x2) / 2.0
+                center_x = smoothed_center_x
                 if smoothed_distance < self.main_target_max_distance_m:
                     center_offset_ratio = abs(
                         center_x - frame_width / 2.0) / frame_width
@@ -535,16 +776,17 @@ class MonoDistanceBaseline:
                     min_ttc_target_id = target_id
                     if self.debug:
                         print(
-                            f"[DEBUG] Frame {self.frame_id} MinTTC Target: ID={target_id}, Class={class_name}, Dist={smoothed_distance:.1f}m, Vel={smoothed_velocity:.1f}m/s, TTC={ttc_s:.1f}s")
+                            f"[DEBUG] Frame {self.frame_id} MinTTC Target: ID={target_id}, StableClass={stable_class}, Dist={smoothed_distance:.1f}m, Vel={smoothed_velocity:.1f}m/s, TTC={ttc_s:.1f}s")
 
                 detections_info.append({
                     "target_id": target_id,
                     "class_name": class_name,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2,
-                    "bbox_height_px": bbox_height_px,
+                    "stable_class": stable_class,
+                    "x1": smoothed_x1,
+                    "y1": smoothed_y1,
+                    "x2": smoothed_x2,
+                    "y2": smoothed_y2,
+                    "bbox_height_px": smoothed_bbox_height_px,
                     "depth_score": depth_score,
                     "distance_m": distance_m,
                     "smoothed_distance": smoothed_distance,
@@ -552,7 +794,7 @@ class MonoDistanceBaseline:
                     "velocity_mps": velocity_mps,
                     "smoothed_velocity": smoothed_velocity,
                     "ttc_s": ttc_s,
-                    "center_x": center_x,
+                    "center_x": smoothed_center_x,
                 })
 
         if main_target_candidates:
@@ -588,27 +830,42 @@ class MonoDistanceBaseline:
                 and self.target_positive_speed_count.get(target_id, 0) >= 3
             )
 
+            # 先确定框的颜色，后面 cv2.rectangle 才能使用 color
             if show_full_ttc:
                 if ttc_s < self.ttc_danger:
-                    color = (0, 0, 255)
+                    color = (0, 0, 255)       # 红色：危险
                 elif ttc_s < self.ttc_warning:
-                    color = (0, 255, 255)
+                    color = (0, 255, 255)     # 黄色：警告
                 else:
-                    color = (0, 255, 0)
+                    color = (0, 255, 0)       # 绿色：安全
             else:
-                color = (0, 255, 0)
+                color = (0, 255, 0)           # 默认绿色
 
-            cv2.rectangle(vis_frame, (int(det["x1"]), int(det["y1"])),
-                          (int(det["x2"]), int(det["y2"])), color, 2)
+            cv2.rectangle(
+                vis_frame,
+                (int(det["x1"]), int(det["y1"])),
+                (int(det["x2"]), int(det["y2"])),
+                color,
+                2
+            )
+
+            # 显示层统一车辆类别，避免 car / truck / bus 抖动影响观感
+            display_class = det["stable_class"]
+            if display_class in {"car", "truck", "bus"}:
+                display_class = "vehicle"
 
             if show_full_ttc:
                 if ttc_s == float("inf"):
                     ttc_str = "inf"
                 else:
                     ttc_str = f"{min(ttc_s, 99.9):.1f}"
-                label = f"{det['class_name']} | {smoothed_distance:.1f}m | v:{smoothed_velocity:.1f}m/s | TTC:{ttc_str}s"
+
+                label = (
+                    f"{display_class} | {smoothed_distance:.1f}m | "
+                    f"v:{smoothed_velocity:.1f}m/s | TTC:{ttc_str}s"
+                )
             else:
-                label = f"{det['class_name']} | {smoothed_distance:.1f}m"
+                label = f"{display_class} | {smoothed_distance:.1f}m"
 
             cv2.putText(
                 vis_frame,
@@ -628,16 +885,17 @@ class MonoDistanceBaseline:
                     "speed": [],
                     "ttc": []
                 }
-            
+
             # 存入数据
             self.all_target_data[target_id]["frames"].append(self.frame_id)
-            self.all_target_data[target_id]["distance"].append(smoothed_distance)
+            self.all_target_data[target_id]["distance"].append(
+                smoothed_distance)
             self.all_target_data[target_id]["speed"].append(smoothed_velocity)
             self.all_target_data[target_id]["ttc"].append(ttc_s)
 
             ttc_csv = "inf" if ttc_s == float("inf") else round(ttc_s, 3)
             self.csv_writer.writerow([
-                self.frame_id, target_id, det["class_name"],
+                self.frame_id, target_id, det["stable_class"],
                 round(det["x1"], 2), round(det["y1"], 2), round(
                     det["x2"], 2), round(det["y2"], 2),
                 round(det["bbox_height_px"], 2),
@@ -647,11 +905,19 @@ class MonoDistanceBaseline:
                 ttc_csv
             ])
 
+        # 拼接原始帧与深度图
+        combined_vis = np.hstack((vis_frame, depth_vis))
+
+        # 保存中间可视化结果
+        if self.intermediate_dir:
+            cv2.imwrite(os.path.join(
+                self.intermediate_dir, f"vis_{self.frame_id:04d}.png"), combined_vis)
+
         if self.debug and self.frame_id % 10 == 0:
             print(
                 f"[DEBUG] Frame {self.frame_id}: MinTTC_ID={self.current_min_ttc_target_id}, MinTTC={self.current_min_ttc:.1f}s")
 
-        return vis_frame
+        return combined_vis
 
     def save_all_target_plots(self, video_name: str):
         if not self.all_target_data:
@@ -663,9 +929,10 @@ class MonoDistanceBaseline:
         for tid, data in self.all_target_data.items():
             if len(data["frames"]) >= 10:  # 至少跟踪10帧才绘图
                 valid_targets.append((tid, data))
-        
+
         # 按帧数降序排列，取前3个
-        top_targets = sorted(valid_targets, key=lambda x: len(x[1]["frames"]), reverse=True)[:3]
+        top_targets = sorted(valid_targets, key=lambda x: len(
+            x[1]["frames"]), reverse=True)[:3]
 
         if not top_targets:
             print(f"[{video_name}] 没有满足条件（>10帧）的目标，跳过绘图。")
@@ -685,7 +952,8 @@ class MonoDistanceBaseline:
             plt.title(f"Target {tid} Distance Curve ({video_name})")
             plt.grid(True)
             dist_name = f"{video_name}_target_{tid}_distance.png"
-            dist_path = os.path.join(self.plot_distance_dir, dist_name) if self.plot_distance_dir else dist_name
+            dist_path = os.path.join(
+                self.plot_distance_dir, dist_name) if self.plot_distance_dir else dist_name
             plt.savefig(dist_path)
             plt.close()
 
@@ -697,7 +965,8 @@ class MonoDistanceBaseline:
             plt.title(f"Target {tid} Speed Curve ({video_name})")
             plt.grid(True)
             speed_name = f"{video_name}_target_{tid}_speed.png"
-            speed_path = os.path.join(self.plot_speed_dir, speed_name) if self.plot_speed_dir else speed_name
+            speed_path = os.path.join(
+                self.plot_speed_dir, speed_name) if self.plot_speed_dir else speed_name
             plt.savefig(speed_path)
             plt.close()
 
@@ -710,11 +979,13 @@ class MonoDistanceBaseline:
             plt.title(f"Target {tid} TTC Curve ({video_name}, inf->20)")
             plt.grid(True)
             ttc_name = f"{video_name}_target_{tid}_ttc.png"
-            ttc_path = os.path.join(self.plot_ttc_dir, ttc_name) if self.plot_ttc_dir else ttc_name
+            ttc_path = os.path.join(
+                self.plot_ttc_dir, ttc_name) if self.plot_ttc_dir else ttc_name
             plt.savefig(ttc_path)
             plt.close()
 
-        print(f"[{video_name}] 已为前 {len(top_targets)} 个目标生成了 {len(top_targets)*3} 张曲线图。")
+        print(
+            f"[{video_name}] 已为前 {len(top_targets)} 个目标生成了 {len(top_targets)*3} 张曲线图。")
 
     def run(self, video_name: str = "output"):
         cap = cv2.VideoCapture(self.video_path)
@@ -738,11 +1009,12 @@ class MonoDistanceBaseline:
         ret, first_frame = cap.read()
         if ret:
             height, width = first_frame.shape[:2]
+            # 拼接深度图后，宽度变为 2 倍
             self.video_writer = cv2.VideoWriter(
                 self.output_video,
                 cv2.VideoWriter_fourcc(*'XVID'),
                 fps,
-                (width, height)
+                (width * 2, height)
             )
             # 处理第一帧
             vis = self.process_frame(first_frame)
@@ -801,11 +1073,15 @@ def process_video_list(video_dir: str, output_dir: str = None):
             distance_plot_dir = os.path.join(output_dir, "distance_curve")
             speed_plot_dir = os.path.join(output_dir, "speed_curve")
             ttc_plot_dir = os.path.join(output_dir, "ttc_curve")
+            depth_dir = os.path.join(output_dir, "depth")
+            intermediate_dir = os.path.join(output_dir, "intermediate")
             os.makedirs(csv_dir, exist_ok=True)
             os.makedirs(avi_dir, exist_ok=True)
             os.makedirs(distance_plot_dir, exist_ok=True)
             os.makedirs(speed_plot_dir, exist_ok=True)
             os.makedirs(ttc_plot_dir, exist_ok=True)
+            os.makedirs(depth_dir, exist_ok=True)
+            os.makedirs(intermediate_dir, exist_ok=True)
 
             output_csv = os.path.join(
                 csv_dir, f"{base_name}.csv")
@@ -822,10 +1098,51 @@ def process_video_list(video_dir: str, output_dir: str = None):
             app.plot_distance_dir = distance_plot_dir
             app.plot_speed_dir = speed_plot_dir
             app.plot_ttc_dir = ttc_plot_dir
+            app.depth_dir = depth_dir
+            app.intermediate_dir = intermediate_dir
         app.run(video_name=base_name)
 
 
 if __name__ == "__main__":
-    video_dir = r".\videos"
-    output_dir = r".\results"
-    process_video_list(video_dir, output_dir)
+    # video_dir = r".\videos"
+    # output_dir = r".\results"
+    # process_video_list(video_dir, output_dir)
+
+    # 仅跑 video_1 的代码
+    video_path = r".\videos\video_5.mp4"
+    output_dir = r".\simple"
+
+    # 手动调用 process_video_list 的逻辑，但只针对 video_1
+    if not os.path.exists(video_path):
+        print(f"错误：找不到视频文件 {video_path}")
+    else:
+        # 模拟 process_video_list 的目录结构
+        base_name = "video_1"
+        csv_dir = os.path.join(output_dir, "csv")
+        avi_dir = os.path.join(output_dir, "avi")
+        distance_plot_dir = os.path.join(output_dir, "distance_curve")
+        speed_plot_dir = os.path.join(output_dir, "speed_curve")
+        ttc_plot_dir = os.path.join(output_dir, "ttc_curve")
+        depth_dir = os.path.join(output_dir, "depth")
+        intermediate_dir = os.path.join(output_dir, "intermediate")
+
+        os.makedirs(csv_dir, exist_ok=True)
+        os.makedirs(avi_dir, exist_ok=True)
+        os.makedirs(distance_plot_dir, exist_ok=True)
+        os.makedirs(speed_plot_dir, exist_ok=True)
+        os.makedirs(ttc_plot_dir, exist_ok=True)
+        os.makedirs(depth_dir, exist_ok=True)
+        os.makedirs(intermediate_dir, exist_ok=True)
+
+        output_csv = os.path.join(csv_dir, f"{base_name}.csv")
+        output_video = os.path.join(avi_dir, f"{base_name}.avi")
+
+        print(f"\n====== 正在处理 (Simple 模式): {video_path} ======")
+        app = MonoDistanceBaseline(video_path, output_csv=output_csv)
+        app.output_video = output_video
+        app.plot_distance_dir = distance_plot_dir
+        app.plot_speed_dir = speed_plot_dir
+        app.plot_ttc_dir = ttc_plot_dir
+        app.depth_dir = depth_dir
+        app.intermediate_dir = intermediate_dir
+        app.run(video_name=base_name)
