@@ -468,4 +468,3 @@ python mono_distance_baseline.py
 * Matplotlib
 
 ---
-
